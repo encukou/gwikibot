@@ -61,8 +61,8 @@ class WikiCache(object):
     :param limit: The cache will not make more than one request each `limit`
         seconds.
     """
-    workset_limit = 100
-    queue_limit = 2
+    workset_limit = 1000
+    queue_limit = 10
 
     def __init__(self, url_base, db_url=None, force_sync=False, limit=5):
         if db_url is None:
@@ -113,6 +113,7 @@ class WikiCache(object):
         else:
             sleep_seconds = (next_time - now()).total_seconds()
             if sleep_seconds > 0:
+                self.log('Current sleep time: {}'.format(sleep_seconds))
                 return sleep_seconds
             else:
                 return 0
@@ -217,22 +218,94 @@ class WikiCache(object):
             return obj
 
     def _request_loop(self):
+        session = self._make_session()
+        wiki = self._get_wiki(session)
         needed_metadata = {}
         needed_pages = {}
         while True:
             self.log('Request loop active')
             self._fill_set_from_queue(needed_metadata, self._needed_metadata)
             self._fill_set_from_queue(needed_pages, self._needed_pages)
+            session.rollback()
+            metadata_chunk, full = self._get_chunk(needed_metadata)
+            if full:
+                for t in self._fetch_metadata(session, wiki, metadata_chunk):
+                    for result in needed_metadata.pop(t):
+                        result.set()
+                break
+
+            if metadata_chunk:
+                self.log('Processing remaining metadata')
+                # The chunk is not full, so include some other metadata
+                # that's missing so far
+                session.rollback()
+                outdated_titles = [t.title for t in self._page_query(
+                    session, wiki).filter(
+                        cacheschema.Page.last_revision == None).all()]
+                metadata_chunk, full = self._get_chunk(outdated_titles,
+                initial=metadata_chunk)
+                for t in self._fetch_metadata(session, wiki, metadata_chunk):
+                    for result in needed_metadata.pop(t):
+                        result.set()
+                break
             gevent.sleep(1)
 
     def _fill_set_from_queue(self, the_set, queue):
+        sleep_seconds = self._sleep_seconds()
         while len(the_set) < self.workset_limit:
             try:
-                title, event = queue.get(timeout=self._sleep_seconds())
+                title, event = queue.get(timeout=sleep_seconds)
                 the_set.setdefault(title, []).append(event)
             except Empty:
                 break
-            print the_set, queue
+
+    def _get_chunk(self, source, initial=(), limit=20, title_limit=700):
+        """Get some pages from a set
+
+        Limit by number of pages (limit) and combined length of titles
+        (title_limit).
+
+        Return (titles, full) where titles is the list of titles in the chunk
+        and full is true iff the chunk is already full.
+        """
+        chunk = set(initial)
+        length = 0
+        source = set(source)
+        while source:
+            title = source.pop()
+            if len(chunk) >= limit or length + len(title) > title_limit:
+                return chunk, True
+            else:
+                chunk.add(title)
+                length += len(title)
+        return chunk, False
+
+    def _fetch_metadata(self, session, wiki, titles):
+        """Fetch page metadata for the given pages.
+
+        :param force: If true (default), all needed metadata will be fetched.
+            Otherwise, some can be left over.
+        """
+        result = self.apirequest(action='query', info='lastrevid',
+                prop='revisions',  # should not be necessary on modern MW
+                titles='|'.join(titles))
+        assert 'normalized' not in result['query'], (
+                result['query']['normalized'])  # XXX: normalization
+        fetched_titles = []
+        for page_info in result['query'].get('pages', []):
+            page = self._page_object(session, wiki, page_info['title'])
+            session.add(page)
+            if 'missing' in page_info:
+                page.last_revision = 0
+                page.revision = 0
+                page.contents = None
+            else:
+                revid = page_info['revisions'][0]['revid']
+                # revid = page_info['lastrevid']  # for the modern MW
+                page.last_revision = revid
+                fetched_titles.append(page.title)
+        session.commit()
+        return fetched_titles
 
     def invalidate_cache(self, session, wiki):
         """Invalidate the entire cache
@@ -279,21 +352,25 @@ class WikiCache(object):
         """
         session = self._make_session()
         wiki = self._get_wiki(session)
-        obj = self._page_object(session, wiki, result.title)
+        title = result.title
+        obj = self._page_object(session, wiki, title)
         # Make sure we know the page's last revision
         # This is a loop since the DB can actually change from under us
         while obj.last_revision is None:
+            self.log('Requesting metadata for {}'.format(title))
             md = AsyncResult()
-            self._needed_metadata.put((result.title, md))
+            self._needed_metadata.put((title, md))
             md.get()
             # Make sure the page's last revision matches our data
             session.rollback()
             if not obj.up_to_date:
+                self.log('Requesting page {}'.format(title))
                 rd = AsyncResult()
-                self._needed_pages.put((result.title, rd))
+                self._needed_pages.put((title, rd))
                 rd.get()
             session.rollback()
             if obj.up_to_date:
+                self.log('Got page {}'.format(title))
                 result._set_result(obj.contents)
                 return
 
