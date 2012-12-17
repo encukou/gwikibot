@@ -22,14 +22,19 @@ class Wiki(TableBase):
 class Page(TableBase):
     __tablename__ = 'articles'
     wiki_id = Column(Unicode, ForeignKey('wikis.url_base'), primary_key=True, nullable=False, info=dict(
-        doc="ID of the Wiki this artile is part of"))
+        doc="ID of the Wiki this article is part of"))
     title = Column(Unicode, primary_key=True, nullable=False, info=dict(
         doc="Title of the article"))
     contents = Column(Unicode, nullable=True, info=dict(
         doc="Textual contents of the article. NULL if there's no such article."))
-    revision = Column(Integer, nullable=False, info=dict(
+    revision = Column(Integer, nullable=True, info=dict(
         doc="RevID of the article that `contents` reflect."))
-    up_to_date = Column(Boolean, nullable=False, info=dict(
-        doc="True if `revision` is provably the last revision of this article as of wiki.sync_timestamp"))
+    last_revision = Column(Integer, nullable=True, info=dict(
+        doc="Last RevID of this article as of wiki.sync_timestamp, or NULL if unknown."))
+
+    @property
+    def up_to_date(self):
+        lastrev = self.last_revision
+        return lastrev is not None and lastrev == self.revision
 
 Page.wiki = relationship(Wiki)
