@@ -11,6 +11,11 @@ from sqlalchemy.orm import sessionmaker
 import sqlalchemy.exc
 import yaml
 
+try:
+    import xml.etree.cElementTree as ElementTree
+except ImportError:
+    import xml.etree.ElementTree as ElementTree
+
 from wikibot import cacheschema
 from wikibot import monkey
 
@@ -74,7 +79,7 @@ class WikiCache(object):
             db_url = os.path.abspath(db_url)
             db_url = 'sqlite:///' + db_url
 
-        self._engine = create_engine(db_url, echo=True)
+        self._engine = create_engine(db_url)
         self._make_session = sessionmaker(bind=self._engine)
 
         self._url_base = url_base
@@ -226,13 +231,22 @@ class WikiCache(object):
             self.log('Request loop active')
             self._fill_set_from_queue(needed_metadata, self._needed_metadata)
             self._fill_set_from_queue(needed_pages, self._needed_pages)
+
             session.rollback()
+            page_chunk, full = self._get_chunk(needed_pages)
+            print 'page chunk', page_chunk, full
+            if full:
+                for t in self._fetch_pages(session, wiki, page_chunk):
+                    for result in needed_pages.pop(t):
+                        result.set()
+                continue
             metadata_chunk, full = self._get_chunk(needed_metadata)
+            print 'MD chunk', metadata_chunk, full
             if full:
                 for t in self._fetch_metadata(session, wiki, metadata_chunk):
                     for result in needed_metadata.pop(t):
                         result.set()
-                break
+                continue
 
             if metadata_chunk:
                 self.log('Processing remaining metadata')
@@ -243,11 +257,28 @@ class WikiCache(object):
                     session, wiki).filter(
                         cacheschema.Page.last_revision == None).all()]
                 metadata_chunk, full = self._get_chunk(outdated_titles,
-                initial=metadata_chunk)
+                    initial=metadata_chunk)
+                print 'MD chunk II', metadata_chunk, full
                 for t in self._fetch_metadata(session, wiki, metadata_chunk):
                     for result in needed_metadata.pop(t):
                         result.set()
-                break
+                continue
+            if page_chunk:
+                self.log('Processing remaining pages')
+                # The chunk is not full, so include some other pages
+                # that are missing so far
+                session.rollback()
+                outdated_titles = [t.title for t in self._page_query(
+                    session, wiki).filter(cacheschema.Page.revision !=
+                        cacheschema.Page.last_revision).all()]
+                page_chunk, full = self._get_chunk(outdated_titles,
+                    initial=page_chunk)
+                print 'page chunk II', page_chunk, full
+                for t in self._fetch_pages(session, wiki, page_chunk):
+                    for result in needed_pages.pop(t):
+                        result.set()
+                continue
+            self.update(force_sync=False)
             gevent.sleep(1)
 
     def _fill_set_from_queue(self, the_set, queue):
@@ -282,9 +313,6 @@ class WikiCache(object):
 
     def _fetch_metadata(self, session, wiki, titles):
         """Fetch page metadata for the given pages.
-
-        :param force: If true (default), all needed metadata will be fetched.
-            Otherwise, some can be left over.
         """
         result = self.apirequest(action='query', info='lastrevid',
                 prop='revisions',  # should not be necessary on modern MW
@@ -303,7 +331,37 @@ class WikiCache(object):
                 revid = page_info['revisions'][0]['revid']
                 # revid = page_info['lastrevid']  # for the modern MW
                 page.last_revision = revid
-                fetched_titles.append(page.title)
+            fetched_titles.append(page.title)
+        session.commit()
+        return fetched_titles
+
+    def _fetch_pages(self, session, wiki, titles):
+        """Fetch given pages from the server.
+        """
+        dump = self._apirequest_raw(action='query',
+                export='1', exportnowrap='1',
+                titles='|'.join(titles))
+        tree = ElementTree.parse(dump)
+        fetched_titles = []
+        for elem in tree.getroot():
+            tag = elem.tag
+            print tag
+            if tag.endswith('}siteinfo'):
+                continue
+            elif tag.endswith('}page'):
+                revision, = (e for e in elem if e.tag.endswith('}revision'))
+                pagename, = (e for e in elem if e.tag.endswith('}title'))
+                text, = (e for e in revision if e.tag.endswith('}text'))
+                revid, = (e for e in revision if e.tag.endswith('}id'))
+                page = self._page_object(session, wiki, pagename.text)
+                page.last_revision = int(revid.text)
+                page.revision = int(revid.text)
+                page.contents = text.text
+                session.add(page)
+                fetched_titles.append(pagename.text)
+            else:
+                print elem, list(elem)
+                raise ValueError(tag)
         session.commit()
         return fetched_titles
 
@@ -355,19 +413,22 @@ class WikiCache(object):
         title = result.title
         obj = self._page_object(session, wiki, title)
         # Make sure we know the page's last revision
-        # This is a loop since the DB can actually change from under us
+        # This is a loop with rollbacks in it,
+        # since the DB can actually change from under us
         while obj.last_revision is None:
+            # Fetch metadata to see if the page has changed (or is empty!)
             self.log('Requesting metadata for {}'.format(title))
             md = AsyncResult()
             self._needed_metadata.put((title, md))
             md.get()
-            # Make sure the page's last revision matches our data
+            # Now, if metadata says we're out of date, actually fetch the page
             session.rollback()
             if not obj.up_to_date:
                 self.log('Requesting page {}'.format(title))
                 rd = AsyncResult()
                 self._needed_pages.put((title, rd))
                 rd.get()
+            # If everything was successful, notify the caller!
             session.rollback()
             if obj.up_to_date:
                 self.log('Got page {}'.format(title))
