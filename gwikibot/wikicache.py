@@ -16,8 +16,8 @@ try:
 except ImportError:
     import xml.etree.ElementTree as ElementTree
 
-from wikibot import cacheschema
-from wikibot import monkey
+from gwikibot import cacheschema
+from gwikibot import monkey
 
 monkey.patch()
 
@@ -84,7 +84,12 @@ class WikiCache(object):
     workset_limit = 1000
     queue_limit = 10
 
-    def __init__(self, url_base, db_url=None, force_sync=False, limit=5):
+    def __init__(
+            self, url_base, db_url=None, force_sync=False, limit=5,
+            verbose=False):
+
+        self.verbose = verbose
+
         if db_url is None:
             db_url = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                 'wikicache.sqlite')
@@ -125,7 +130,8 @@ class WikiCache(object):
     def log(self, string):
         """Log a message"""
         # TODO: Something more fancy
-        print string
+        if self.verbose:
+            print string
 
     def _sleep_seconds(self):
         """Number of seconds to sleep until next request"""

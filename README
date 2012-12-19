@@ -1,0 +1,15 @@
+A gevent-based MediaWiki cache.
+
+A simple example (note that due to rate limiting, first access will take
+some time):
+
+>>> from gwikibot.wikicache import WikiCache
+>>> cache = WikiCache('http://mediawiki-encukou.rhcloud.com/api.php?')
+>>> article = cache['Example page for readme']
+>>> print article.title
+Example page for readme
+>>> print article.text
+Hello!
+This is an example page for a README.
+<br>
+Check it out at http://mediawiki-encukou.rhcloud.com/index.php/Example_page_for_readme
