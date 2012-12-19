@@ -22,6 +22,14 @@ from wikibot import monkey
 monkey.patch()
 
 class PageProxy(object):
+    """A page in a wiki
+
+    The page may not be loaded when this object is created; accessing its
+    attributes may block.
+
+    A page is true in a boolean context if it exists on the wiki.
+    (Note that the usage in a bool context may also block.)
+    """
     def __init__(self, cache, title):
         self.title = title
         self.cache = cache
@@ -32,19 +40,23 @@ class PageProxy(object):
 
     @property
     def up_to_date(self):
+        """Return True if the page is up to date"""
         self._result.get()
         return True
 
     @property
     def contents(self):
+        """Return the contents of the page, or None if the page is missing"""
         return self._result.get()
 
     @property
     def exists(self):
+        """Return true if the page exists on the wiki"""
         return self.contents is not None
 
     @property
     def text(self):
+        """Return the contents of the page; raise ValueError if page missing"""
         if self.exists:
             return self.contents
         else:
@@ -65,6 +77,9 @@ class WikiCache(object):
         used.
     :param limit: The cache will not make more than one request each `limit`
         seconds.
+
+    Use the cache as a dictionary: ``cache[page_title]`` will give you a
+    PageProxy object.
     """
     workset_limit = 1000
     queue_limit = 10
@@ -92,6 +107,7 @@ class WikiCache(object):
         gevent.spawn(self._request_loop)
 
     def _get_wiki(self, session):
+        """Get the wiki object, creating one if necessary"""
         query = session.query(cacheschema.Wiki).filter_by(
             url_base=self._url_base)
         try:
@@ -103,9 +119,12 @@ class WikiCache(object):
             wiki.url_base = self._url_base
             wiki.sync_timestamp = None
             session.add(wiki)
+            session.commit()
             return wiki
 
     def log(self, string):
+        """Log a message"""
+        # TODO: Something more fancy
         print string
 
     def _sleep_seconds(self):
@@ -124,6 +143,10 @@ class WikiCache(object):
                 return 0
 
     def _sleep_before_request(self):
+        """Sleep before another request can be made
+
+        The request rate is controlled by the "limit" attribute
+        """
         sleep_seconds = self._sleep_seconds()
         if sleep_seconds > 0:
             self.log('Sleeping %ss' % sleep_seconds)
@@ -205,6 +228,7 @@ class WikiCache(object):
         session.commit()
 
     def _page_query(self, session, wiki):
+        """Return a SQLA query for pages on this wiki"""
         return session.query(cacheschema.Page).filter_by(wiki=wiki)
 
     def _page_object(self, session, wiki, title):
@@ -223,6 +247,8 @@ class WikiCache(object):
             return obj
 
     def _request_loop(self):
+        """The greenlet that requests needed metadata/pages
+        """
         session = self._make_session()
         wiki = self._get_wiki(session)
         needed_metadata = {}
@@ -238,12 +264,14 @@ class WikiCache(object):
             self._fill_set_from_queue(needed_pages, self._needed_pages)
 
             done, finish_pages = self._try_fetch(session, wiki,
-                self._fetch_pages, needed_pages, page_query)
+                self._fetch_pages, needed_pages, page_query,
+                chunk_limit=20)
             if done:
                 continue
 
             done, finish_md = self._try_fetch(session, wiki,
-                self._fetch_metadata, needed_metadata, md_query)
+                self._fetch_metadata, needed_metadata, md_query,
+                chunk_limit=50)
             if done:
                 continue
 
@@ -258,14 +286,38 @@ class WikiCache(object):
             self.update(force_sync=False)
             gevent.sleep(1)
 
-    def _try_fetch(self, session, wiki, fetch_func, work_set, extra_query):
+    def _try_fetch(self, session, wiki, fetch_func, work_set, extra_query,
+            chunk_limit):
+        """Generic function for fetching some info from the server
+
+        :param session: The session to use
+        :param wiki: The wiki object to use
+        :param fetch_func:
+            Function that does the work, see _fetch_metadata for signature
+        :param work_set:
+            Set of titles that were requested to be processed by fetch_func
+        :param extra_query:
+            Query that yields Page objects that should be processed by
+            fetch_func, but were not explicitly requested.
+            This is used to "fill up" API requests, so that we fetch as many
+            possibly useful pages as we can.
+        :param chunk_limit:
+            Limit for how many pages can be processed in a single API request.
+            Note that there is also an URL size limit.
+
+        :return (done, next):
+            done: If a query was made, return True
+            next: If not enough pages were accumulated yet for a "full"
+                request, a function is returned here. Call it to process the
+                remaining pages.
+        """
         def _process(chunk):
             for t in fetch_func(session, wiki, chunk):
                 for result in work_set.pop(t):
                     result.set()
 
         session.rollback()
-        current_chunk, full = self._get_chunk(work_set)
+        current_chunk, full = self._get_chunk(work_set, limit=chunk_limit)
         if full:
             _process()
             return True, None
@@ -274,13 +326,18 @@ class WikiCache(object):
                 session.rollback()
                 finish_chunk, full = self._get_chunk(
                     [t.title for t in extra_query.limit(50)],
-                    initial=current_chunk)
+                    initial=current_chunk, limit=chunk_limit)
                 _process(finish_chunk)
             return False, fetch_remaining
         else:
             return False, None
 
     def _fill_set_from_queue(self, the_set, queue):
+        """Fill a working set from a queue
+
+        We keep at most ``workset_limit`` items in the set; if the set
+        gets filled up, we block until some requests are processed.
+        """
         sleep_seconds = self._sleep_seconds()
         while len(the_set) < self.workset_limit:
             try:
@@ -335,7 +392,10 @@ class WikiCache(object):
         return fetched_titles
 
     def _fetch_pages(self, session, wiki, titles):
-        """Fetch given pages from the server.
+        """Fetch content of the given pages from the server.
+
+        Missing pages should not be given to this method! They will make the
+        whole request fail.
         """
         dump = self._apirequest_raw(action='query',
                 export='1', exportnowrap='1',
@@ -404,7 +464,10 @@ class WikiCache(object):
         return result
 
     def _read(self, result):
-        """Fill the result
+        """Greenlet to fill a PageProxy object
+
+        Submits work to the queues until a page is fully fetched from the
+        server, then sets the PageProxy result to unblock the consumer
         """
         session = self._make_session()
         wiki = self._get_wiki(session)
