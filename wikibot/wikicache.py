@@ -227,55 +227,58 @@ class WikiCache(object):
         wiki = self._get_wiki(session)
         needed_metadata = {}
         needed_pages = {}
+        page_query = self._page_query(session, wiki).filter(
+            cacheschema.Page.revision != cacheschema.Page.last_revision,
+            cacheschema.Page.revision != None)
+        md_query = self._page_query(session, wiki).filter(
+            cacheschema.Page.last_revision == None)
         while True:
             self.log('Request loop active')
             self._fill_set_from_queue(needed_metadata, self._needed_metadata)
             self._fill_set_from_queue(needed_pages, self._needed_pages)
 
-            session.rollback()
-            page_chunk, full = self._get_chunk(needed_pages)
-            if full:
-                for t in self._fetch_pages(session, wiki, page_chunk):
-                    for result in needed_pages.pop(t):
-                        result.set()
-                continue
-            metadata_chunk, full = self._get_chunk(needed_metadata)
-            if full:
-                for t in self._fetch_metadata(session, wiki, metadata_chunk):
-                    for result in needed_metadata.pop(t):
-                        result.set()
+            done, finish_pages = self._try_fetch(session, wiki,
+                self._fetch_pages, needed_pages, page_query)
+            if done:
                 continue
 
-            if metadata_chunk:
-                self.log('Processing remaining metadata')
-                # The chunk is not full, so include some other metadata
-                # that's missing so far
-                session.rollback()
-                outdated_titles = [t.title for t in self._page_query(
-                    session, wiki).filter(
-                        cacheschema.Page.last_revision == None).all()]
-                metadata_chunk, full = self._get_chunk(outdated_titles,
-                    initial=metadata_chunk)
-                for t in self._fetch_metadata(session, wiki, metadata_chunk):
-                    for result in needed_metadata.pop(t):
-                        result.set()
+            done, finish_md = self._try_fetch(session, wiki,
+                self._fetch_metadata, needed_metadata, md_query)
+            if done:
                 continue
-            if page_chunk:
-                self.log('Processing remaining pages')
-                # The chunk is not full, so include some other pages
-                # that are missing so far
-                session.rollback()
-                outdated_titles = [t.title for t in self._page_query(
-                    session, wiki).filter(cacheschema.Page.revision !=
-                        cacheschema.Page.last_revision).all()]
-                page_chunk, full = self._get_chunk(outdated_titles,
-                    initial=page_chunk)
-                for t in self._fetch_pages(session, wiki, page_chunk):
-                    for result in needed_pages.pop(t):
-                        result.set()
+
+            if finish_md:
+                finish_md()
                 continue
+
+            if finish_pages:
+                finish_pages()
+                continue
+
             self.update(force_sync=False)
             gevent.sleep(1)
+
+    def _try_fetch(self, session, wiki, fetch_func, work_set, extra_query):
+        def _process(chunk):
+            for t in fetch_func(session, wiki, chunk):
+                for result in work_set.pop(t):
+                    result.set()
+
+        session.rollback()
+        current_chunk, full = self._get_chunk(work_set)
+        if full:
+            _process()
+            return True, None
+        if current_chunk:
+            def fetch_remaining():
+                session.rollback()
+                finish_chunk, full = self._get_chunk(
+                    [t.title for t in extra_query.limit(50)],
+                    initial=current_chunk)
+                _process(finish_chunk)
+            return False, fetch_remaining
+        else:
+            return False, None
 
     def _fill_set_from_queue(self, the_set, queue):
         sleep_seconds = self._sleep_seconds()
@@ -374,6 +377,7 @@ class WikiCache(object):
     def normalize_title(self, title):
         # TODO: http://www.mediawiki.org/wiki/API:Query#Title_normalization
         title = title.replace('_', ' ')
+        title = title.replace('\n', '')
         return title[0].upper() + title[1:]
 
 
