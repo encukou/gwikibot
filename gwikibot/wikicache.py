@@ -319,7 +319,7 @@ class WikiCache(object):
         """
         def _process(chunk):
             for t in fetch_func(session, wiki, chunk):
-                for result in work_set.pop(t):
+                for result in work_set.pop(t, ()):
                     result.set()
 
         session.rollback()
