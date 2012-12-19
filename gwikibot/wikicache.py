@@ -111,12 +111,13 @@ class WikiCache(object):
 
         gevent.spawn(self._request_loop)
 
-    def _get_wiki(self, session):
+    def _get_wiki(self):
         """Get the wiki object, creating one if necessary"""
+        session = self._make_session()
         query = session.query(cacheschema.Wiki).filter_by(
             url_base=self._url_base)
         try:
-            return query.one()
+            wiki = query.one()
         except (sqlalchemy.exc.OperationalError,
                 sqlalchemy.orm.exc.NoResultFound):
             cacheschema.metadata.create_all(self._engine)
@@ -125,7 +126,8 @@ class WikiCache(object):
             wiki.sync_timestamp = None
             session.add(wiki)
             session.commit()
-            return wiki
+        wiki.session = session
+        return wiki
 
     def log(self, string):
         """Log a message"""
@@ -181,8 +183,7 @@ class WikiCache(object):
 
     def update(self, force_sync=True):
         """Fetch a batch of page changes from the server"""
-        session = self._make_session()
-        wiki = self._get_wiki(session)
+        wiki = self._get_wiki()
         if wiki.last_update and not force_sync:
             thresh = datetime.datetime.today() - datetime.timedelta(minutes=5)
             if wiki.last_update > thresh:
@@ -196,8 +197,8 @@ class WikiCache(object):
             last_change = feed['query']['recentchanges'][0]
             wiki.sync_timestamp = last_change['timestamp']
             wiki.synced = True
-            self.invalidate_cache(session, wiki)
-            session.commit()
+            self.invalidate_cache(wiki)
+            wiki.session.commit()
         else:
             self.log('Updating cache')
             feed = self.apirequest(action='query', list='recentchanges',
@@ -213,10 +214,10 @@ class WikiCache(object):
                     if title not in invalidated:
                         self.log(u'Change to {0} by {1}'.format(title,
                                 change['user']))
-                        obj = self._page_object(session, wiki, title)
+                        obj = self._page_object(wiki, title)
                         obj.last_revision = None
                         invalidated.add(title)
-                session.commit()
+                wiki.session.commit()
                 try:
                     feed = self.apirequest(action='query', list='recentchanges',
                             rcprop='title|user|timestamp', rclimit=100,
@@ -229,19 +230,19 @@ class WikiCache(object):
                     wiki.synced = True
                 else:
                     wiki.synced = False
-                session.commit()
+                wiki.session.commit()
         wiki.last_update = datetime.datetime.today()
-        session.commit()
+        wiki.session.commit()
 
-    def _page_query(self, session, wiki):
+    def _page_query(self, wiki):
         """Return a SQLA query for pages on this wiki"""
-        return session.query(cacheschema.Page).filter_by(wiki=wiki)
+        return wiki.session.query(cacheschema.Page).filter_by(wiki=wiki)
 
-    def _page_object(self, session, wiki, title):
+    def _page_object(self, wiki, title):
         """Get an object for the page 'title', *w/o* adding it to the session
         """
         title = self.normalize_title(title)
-        obj = session.query(cacheschema.Page).get((self._url_base, title))
+        obj = wiki.session.query(cacheschema.Page).get((self._url_base, title))
         if obj:
             return obj
         else:
@@ -255,27 +256,26 @@ class WikiCache(object):
     def _request_loop(self):
         """The greenlet that requests needed metadata/pages
         """
-        session = self._make_session()
-        wiki = self._get_wiki(session)
+        wiki = self._get_wiki()
         needed_metadata = {}
         needed_pages = {}
-        page_query = self._page_query(session, wiki).filter(
+        page_query = self._page_query(wiki).filter(
             cacheschema.Page.revision != cacheschema.Page.last_revision,
             cacheschema.Page.revision != None)
-        md_query = self._page_query(session, wiki).filter(
+        md_query = self._page_query(wiki).filter(
             cacheschema.Page.last_revision == None)
         while True:
             self.log('Request loop active')
             self._fill_set_from_queue(needed_metadata, self._needed_metadata)
             self._fill_set_from_queue(needed_pages, self._needed_pages)
 
-            done, finish_pages = self._try_fetch(session, wiki,
+            done, finish_pages = self._try_fetch(wiki,
                 self._fetch_pages, needed_pages, page_query,
                 chunk_limit=20)
             if done:
                 continue
 
-            done, finish_md = self._try_fetch(session, wiki,
+            done, finish_md = self._try_fetch(wiki,
                 self._fetch_metadata, needed_metadata, md_query,
                 chunk_limit=50)
             if done:
@@ -292,11 +292,10 @@ class WikiCache(object):
             self.update(force_sync=False)
             gevent.sleep(1)
 
-    def _try_fetch(self, session, wiki, fetch_func, work_set, extra_query,
+    def _try_fetch(self, wiki, fetch_func, work_set, extra_query,
             chunk_limit):
         """Generic function for fetching some info from the server
 
-        :param session: The session to use
         :param wiki: The wiki object to use
         :param fetch_func:
             Function that does the work, see _fetch_metadata for signature
@@ -318,18 +317,18 @@ class WikiCache(object):
                 remaining pages.
         """
         def _process(chunk):
-            for t in fetch_func(session, wiki, chunk):
+            for t in fetch_func(wiki, chunk):
                 for result in work_set.pop(t, ()):
                     result.set()
 
-        session.rollback()
+        wiki.session.rollback()
         current_chunk, full = self._get_chunk(work_set, limit=chunk_limit)
         if full:
             _process()
             return True, None
         if current_chunk:
             def fetch_remaining():
-                session.rollback()
+                wiki.session.rollback()
                 finish_chunk, full = self._get_chunk(
                     [t.title for t in extra_query.limit(50)],
                     initial=current_chunk, limit=chunk_limit)
@@ -373,7 +372,7 @@ class WikiCache(object):
                 length += len(title)
         return chunk, False
 
-    def _fetch_metadata(self, session, wiki, titles):
+    def _fetch_metadata(self, wiki, titles):
         """Fetch page metadata for the given pages.
         """
         result = self.apirequest(action='query', info='lastrevid',
@@ -383,8 +382,8 @@ class WikiCache(object):
                 result['query']['normalized'])  # XXX: normalization
         fetched_titles = []
         for page_info in result['query'].get('pages', []):
-            page = self._page_object(session, wiki, page_info['title'])
-            session.add(page)
+            page = self._page_object(wiki, page_info['title'])
+            wiki.session.add(page)
             if 'missing' in page_info:
                 page.last_revision = 0
                 page.revision = 0
@@ -394,10 +393,10 @@ class WikiCache(object):
                 # revid = page_info['lastrevid']  # for the modern MW
                 page.last_revision = revid
             fetched_titles.append(page.title)
-        session.commit()
+        wiki.session.commit()
         return fetched_titles
 
-    def _fetch_pages(self, session, wiki, titles):
+    def _fetch_pages(self, wiki, titles):
         """Fetch content of the given pages from the server.
 
         Missing pages should not be given to this method! They will make the
@@ -417,18 +416,18 @@ class WikiCache(object):
                 pagename, = (e for e in elem if e.tag.endswith('}title'))
                 text, = (e for e in revision if e.tag.endswith('}text'))
                 revid, = (e for e in revision if e.tag.endswith('}id'))
-                page = self._page_object(session, wiki, pagename.text)
+                page = self._page_object(wiki, pagename.text)
                 page.last_revision = int(revid.text)
                 page.revision = int(revid.text)
                 page.contents = text.text
-                session.add(page)
+                wiki.session.add(page)
                 fetched_titles.append(pagename.text)
             else:
                 raise ValueError(tag)
-        session.commit()
+        wiki.session.commit()
         return fetched_titles
 
-    def invalidate_cache(self, session, wiki):
+    def invalidate_cache(self, wiki):
         """Invalidate the entire cache
 
         This marks all articles for re-downloading when requested.
@@ -436,8 +435,8 @@ class WikiCache(object):
         entirely, only their metadata will be queried.
         (To clear the cache entirely, truncate the articles table.)
         """
-        self._page_query(session, wiki).update({'last_revision': None})
-        session.commit()
+        self._page_query(wiki).update({'last_revision': None})
+        wiki.session.commit()
 
 
     def normalize_title(self, title):
@@ -475,12 +474,11 @@ class WikiCache(object):
         Submits work to the queues until a page is fully fetched from the
         server, then sets the PageProxy result to unblock the consumer
         """
-        session = self._make_session()
-        wiki = self._get_wiki(session)
+        wiki = self._get_wiki()
         title = result.title
-        obj = self._page_object(session, wiki, title)
-        session.add(obj)
-        session.commit()
+        obj = self._page_object(wiki, title)
+        wiki.session.add(obj)
+        wiki.session.commit()
         # Make sure we know the page's last revision
         # This is a loop with rollbacks in it, since the DB can change under us
         while True:
@@ -492,17 +490,17 @@ class WikiCache(object):
                 self._needed_metadata.put((title, md))
                 md.get()
             # Now, if metadata says we're out of date, actually fetch the page
-            session.refresh(obj)
+            wiki.session.refresh(obj)
             if not obj.up_to_date:
                 self.log('Requesting page {}'.format(title))
                 rd = AsyncResult()
                 self._needed_pages.put((title, rd))
                 rd.get()
             # If everything was successful, notify the caller!
-            session.refresh(obj)
+            wiki.session.refresh(obj)
             if obj.up_to_date:
                 result._set_result(obj.contents)
-                session.rollback()
+                wiki.session.rollback()
                 return
 
     def __getitem__(self, title):
