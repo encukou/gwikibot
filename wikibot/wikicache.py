@@ -234,14 +234,12 @@ class WikiCache(object):
 
             session.rollback()
             page_chunk, full = self._get_chunk(needed_pages)
-            print 'page chunk', page_chunk, full
             if full:
                 for t in self._fetch_pages(session, wiki, page_chunk):
                     for result in needed_pages.pop(t):
                         result.set()
                 continue
             metadata_chunk, full = self._get_chunk(needed_metadata)
-            print 'MD chunk', metadata_chunk, full
             if full:
                 for t in self._fetch_metadata(session, wiki, metadata_chunk):
                     for result in needed_metadata.pop(t):
@@ -258,7 +256,6 @@ class WikiCache(object):
                         cacheschema.Page.last_revision == None).all()]
                 metadata_chunk, full = self._get_chunk(outdated_titles,
                     initial=metadata_chunk)
-                print 'MD chunk II', metadata_chunk, full
                 for t in self._fetch_metadata(session, wiki, metadata_chunk):
                     for result in needed_metadata.pop(t):
                         result.set()
@@ -273,7 +270,6 @@ class WikiCache(object):
                         cacheschema.Page.last_revision).all()]
                 page_chunk, full = self._get_chunk(outdated_titles,
                     initial=page_chunk)
-                print 'page chunk II', page_chunk, full
                 for t in self._fetch_pages(session, wiki, page_chunk):
                     for result in needed_pages.pop(t):
                         result.set()
@@ -345,7 +341,6 @@ class WikiCache(object):
         fetched_titles = []
         for elem in tree.getroot():
             tag = elem.tag
-            print tag
             if tag.endswith('}siteinfo'):
                 continue
             elif tag.endswith('}page'):
@@ -360,7 +355,6 @@ class WikiCache(object):
                 session.add(page)
                 fetched_titles.append(pagename.text)
             else:
-                print elem, list(elem)
                 raise ValueError(tag)
         session.commit()
         return fetched_titles
@@ -412,27 +406,30 @@ class WikiCache(object):
         wiki = self._get_wiki(session)
         title = result.title
         obj = self._page_object(session, wiki, title)
+        session.add(obj)
+        session.commit()
         # Make sure we know the page's last revision
-        # This is a loop with rollbacks in it,
-        # since the DB can actually change from under us
-        while obj.last_revision is None:
+        # This is a loop with rollbacks in it, since the DB can change under us
+        while True:
             # Fetch metadata to see if the page has changed (or is empty!)
-            self.log('Requesting metadata for {}'.format(title))
-            md = AsyncResult()
-            self._needed_metadata.put((title, md))
-            md.get()
+            if obj.last_revision is None or (not obj.up_to_date and
+                    obj.contents is None):
+                self.log('Requesting metadata for {}'.format(title))
+                md = AsyncResult()
+                self._needed_metadata.put((title, md))
+                md.get()
             # Now, if metadata says we're out of date, actually fetch the page
-            session.rollback()
+            session.refresh(obj)
             if not obj.up_to_date:
                 self.log('Requesting page {}'.format(title))
                 rd = AsyncResult()
                 self._needed_pages.put((title, rd))
                 rd.get()
             # If everything was successful, notify the caller!
-            session.rollback()
+            session.refresh(obj)
             if obj.up_to_date:
-                self.log('Got page {}'.format(title))
                 result._set_result(obj.contents)
+                session.rollback()
                 return
 
     def __getitem__(self, title):

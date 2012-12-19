@@ -37,4 +37,9 @@ class Page(TableBase):
         lastrev = self.last_revision
         return lastrev is not None and lastrev == self.revision
 
+    def __repr__(self):
+        return '<Page {}: rev {}, last {}, content {}>'.format(
+            self.title, self.revision, self.last_revision,
+            self.contents is not None)
+
 Page.wiki = relationship(Wiki)
