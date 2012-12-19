@@ -14,7 +14,7 @@ class Wiki(TableBase):
         doc="MediaWiki API URL base, including the '?', e.g. 'http://en.wikipedia.org/w/api.php?'"))
     synced = Column(Boolean, nullable=True, info=dict(
         doc="If True, the cache is synced to the server."))
-    sync_timestamp = Column(PickleType, nullable=False, info=dict(
+    sync_timestamp = Column(PickleType, nullable=True, info=dict(
         doc="timestamp for the next sync. (If None, cache will be invalidated.)"))
     last_update = Column(DateTime, nullable=True, info=dict(
         doc="Time of the last update."))
