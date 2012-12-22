@@ -8,6 +8,7 @@ args = dict(
         'sqlalchemy',
         'gevent',
         'pyyaml',
+        'requests',
     ],
 )
 

@@ -1,9 +1,9 @@
 import os
 import datetime
-import urllib
 import heapq
 
 import gevent
+import requests
 from gevent.event import AsyncResult
 from gevent.queue import Queue, Empty
 from sqlalchemy import create_engine
@@ -70,8 +70,8 @@ class PageProxy(object):
 class WikiCache(object):
     """A cache of a MediaWiki
 
-    :param url_base: Base URL of the MediaWiki API, including a '?',
-        e.g. 'http://en.wikipedia.org/w/api.php?'
+    :param url_base: Base URL of the MediaWiki API,
+        e.g. 'http://en.wikipedia.org/w/api.php'
     :param db_path: Path to a SQLite file holding the cache, or SQLAlchemy
         database URL. If not given, a file next to the wikicache module will be
         used.
@@ -161,16 +161,14 @@ class WikiCache(object):
             gevent.sleep(sleep_seconds)
 
     def _apirequest_raw(self, **params):
-        """Raw MW API request; returns filelike object"""
+        """Raw MW API request; returns Requests response"""
 
         self._sleep_before_request()
 
         try:
-            enc = lambda s: unicode(s).encode('utf-8')
-            params = [(enc(k), enc(v)) for k, v in params.items()]
-            url = self._url_base + urllib.urlencode(params)
-            self.log('GET %s' % url)
-            result = urllib.urlopen(url)
+            result = requests.post(self._url_base, data=params, stream=True)
+            self.log('POST {} {}'.format(result.url, params))
+            result.raise_for_status()
             return result
         finally:
             self._next_request_time = (datetime.datetime.today() +
@@ -179,7 +177,7 @@ class WikiCache(object):
     def apirequest(self, **params):
         """MW API request; returns result dict"""
         params['format'] = 'yaml'
-        return yaml.load(self._apirequest_raw(**params))
+        return yaml.safe_load(self._apirequest_raw(**params).text)
 
     def update(self, force_sync=True):
         """Fetch a batch of page changes from the server"""
@@ -404,7 +402,7 @@ class WikiCache(object):
         """
         dump = self._apirequest_raw(action='query',
                 export='1', exportnowrap='1',
-                titles='|'.join(titles))
+                titles='|'.join(titles)).raw
         tree = ElementTree.parse(dump)
         fetched_titles = []
         for elem in tree.getroot():

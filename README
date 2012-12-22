@@ -4,7 +4,7 @@ A simple example (note that due to rate limiting, first access will take
 some time):
 
 >>> from gwikibot.wikicache import WikiCache
->>> cache = WikiCache('http://mediawiki-encukou.rhcloud.com/api.php?')
+>>> cache = WikiCache('http://mediawiki-encukou.rhcloud.com/api.php')
 >>> article = cache['Example page for readme']
 >>> print article.title
 Example page for readme
