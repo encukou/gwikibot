@@ -1,6 +1,8 @@
 import os
 import datetime
 import heapq
+import itertools
+import collections
 
 import gevent
 import requests
@@ -81,9 +83,6 @@ class WikiCache(object):
     Use the cache as a dictionary: ``cache[page_title]`` will give you a
     PageProxy object.
     """
-    workset_limit = 1000
-    queue_limit = 10
-
     def __init__(
             self, url_base, db_url=None, force_sync=False, limit=5,
             verbose=False):
@@ -104,14 +103,14 @@ class WikiCache(object):
 
         self._url_base = url_base
         self.limit = limit
-        self._needed_metadata = Queue(0)
-        self._needed_pages = Queue(0)
+        self.request_queue = Queue(0)
 
-        self.update(force_sync=force_sync)
+        self._updated = AsyncResult()
 
-        gevent.spawn(self._request_loop)
+        gevent.spawn(self._request_loop, force_sync)
+        gevent.sleep(0)
 
-    def _get_wiki(self):
+    def get_wiki(self):
         """Get the wiki object, creating one if necessary"""
         session = self._make_session()
         query = session.query(cacheschema.Wiki).filter_by(
@@ -145,7 +144,6 @@ class WikiCache(object):
         else:
             sleep_seconds = (next_time - now()).total_seconds()
             if sleep_seconds > 0:
-                self.log('Current sleep time: {}'.format(sleep_seconds))
                 return sleep_seconds
             else:
                 return 0
@@ -181,7 +179,7 @@ class WikiCache(object):
 
     def update(self, force_sync=True):
         """Fetch a batch of page changes from the server"""
-        wiki = self._get_wiki()
+        wiki = self.get_wiki()
         if wiki.last_update and not force_sync:
             thresh = datetime.datetime.today() - datetime.timedelta(minutes=5)
             if wiki.last_update > thresh:
@@ -251,179 +249,38 @@ class WikiCache(object):
             obj.last_revision = None
             return obj
 
-    def _request_loop(self):
+    def _request_loop(self, force_sync):
         """The greenlet that requests needed metadata/pages
         """
-        wiki = self._get_wiki()
-        needed_metadata = {}
-        needed_pages = {}
-        page_query = self._page_query(wiki).filter(
-            cacheschema.Page.revision != cacheschema.Page.last_revision,
-            cacheschema.Page.revision != None)
-        md_query = self._page_query(wiki).filter(
-            cacheschema.Page.last_revision == None)
+        self.update(force_sync=force_sync)
+        self._updated.set()
+
+        requests = {}
         while True:
             self.log('Request loop active')
-            self._fill_set_from_queue(needed_metadata, self._needed_metadata)
-            self._fill_set_from_queue(needed_pages, self._needed_pages)
 
-            done, finish_pages = self._try_fetch(wiki,
-                self._fetch_pages, needed_pages, page_query,
-                chunk_limit=20)
-            if done:
-                continue
+            while True:
+                while not self.request_queue.empty():
+                    self.request_queue.get().insert_into(requests)
+                try:
+                    request = self.request_queue.get(
+                        timeout=self._sleep_seconds())
+                except Empty:
+                    break
+                else:
+                    request.insert_into(requests)
 
-            done, finish_md = self._try_fetch(wiki,
-                self._fetch_metadata, needed_metadata, md_query,
-                chunk_limit=50)
-            if done:
-                continue
-
-            if finish_md:
-                finish_md()
-                continue
-
-            if finish_pages:
-                finish_pages()
-                continue
-
-            self.update(force_sync=False)
-            gevent.sleep(1)
-
-    def _try_fetch(self, wiki, fetch_func, work_set, extra_query,
-            chunk_limit):
-        """Generic function for fetching some info from the server
-
-        :param wiki: The wiki object to use
-        :param fetch_func:
-            Function that does the work, see _fetch_metadata for signature
-        :param work_set:
-            Set of titles that were requested to be processed by fetch_func
-        :param extra_query:
-            Query that yields Page objects that should be processed by
-            fetch_func, but were not explicitly requested.
-            This is used to "fill up" API requests, so that we fetch as many
-            possibly useful pages as we can.
-        :param chunk_limit:
-            Limit for how many pages can be processed in a single API request.
-            Note that there is also an URL size limit.
-
-        :return (done, next):
-            done: If a query was made, return True
-            next: If not enough pages were accumulated yet for a "full"
-                request, a function is returned here. Call it to process the
-                remaining pages.
-        """
-        def _process(chunk):
-            for t in fetch_func(wiki, chunk):
-                for result in work_set.pop(t, ()):
-                    result.set()
-
-        wiki.session.rollback()
-        current_chunk, full = self._get_chunk(work_set, limit=chunk_limit)
-        if full:
-            _process()
-            return True, None
-        if current_chunk:
-            def fetch_remaining():
-                wiki.session.rollback()
-                finish_chunk, full = self._get_chunk(
-                    [t.title for t in extra_query.limit(50)],
-                    initial=current_chunk, limit=chunk_limit)
-                _process(finish_chunk)
-            return False, fetch_remaining
-        else:
-            return False, None
-
-    def _fill_set_from_queue(self, the_set, queue):
-        """Fill a working set from a queue
-
-        We keep at most ``workset_limit`` items in the set; if the set
-        gets filled up, we block until some requests are processed.
-        """
-        sleep_seconds = self._sleep_seconds()
-        while len(the_set) < self.workset_limit:
-            try:
-                title, event = queue.get(timeout=sleep_seconds)
-                the_set.setdefault(title, []).append(event)
-            except Empty:
-                break
-
-    def _get_chunk(self, source, initial=(), limit=20, title_limit=700):
-        """Get some pages from a set
-
-        Limit by number of pages (limit) and combined length of titles
-        (title_limit).
-
-        Return (titles, full) where titles is the list of titles in the chunk
-        and full is true iff the chunk is already full.
-        """
-        chunk = set(initial)
-        length = 0
-        source = set(source)
-        while source:
-            title = source.pop()
-            if len(chunk) >= limit or length + len(title) > title_limit:
-                return chunk, True
+            request_list = [(k, v) for k, v in requests.items() if v]
+            request_list.sort(key=lambda k_v: -len(k_v[1]))
+            requests = dict(request_list)
+            if request_list:
+                for k, v in request_list[0][1].items():
+                    v.run(requests)
+                    break
             else:
-                chunk.add(title)
-                length += len(title)
-        return chunk, False
+                self.update(force_sync=False)
+                gevent.sleep(self._sleep_seconds())
 
-    def _fetch_metadata(self, wiki, titles):
-        """Fetch page metadata for the given pages.
-        """
-        result = self.apirequest(action='query', info='lastrevid',
-                prop='revisions',  # should not be necessary on modern MW
-                titles='|'.join(titles))
-        assert 'normalized' not in result['query'], (
-                result['query']['normalized'])  # XXX: normalization
-        fetched_titles = []
-        for page_info in result['query'].get('pages', []):
-            page = self._page_object(wiki, page_info['title'])
-            wiki.session.add(page)
-            if 'missing' in page_info:
-                page.last_revision = 0
-                page.revision = 0
-                page.contents = None
-            else:
-                revid = page_info['revisions'][0]['revid']
-                # revid = page_info['lastrevid']  # for the modern MW
-                page.last_revision = revid
-            fetched_titles.append(page.title)
-        wiki.session.commit()
-        return fetched_titles
-
-    def _fetch_pages(self, wiki, titles):
-        """Fetch content of the given pages from the server.
-
-        Missing pages should not be given to this method! They will make the
-        whole request fail.
-        """
-        dump = self._apirequest_raw(action='query',
-                export='1', exportnowrap='1',
-                titles='|'.join(titles)).raw
-        tree = ElementTree.parse(dump)
-        fetched_titles = []
-        for elem in tree.getroot():
-            tag = elem.tag
-            if tag.endswith('}siteinfo'):
-                continue
-            elif tag.endswith('}page'):
-                revision, = (e for e in elem if e.tag.endswith('}revision'))
-                pagename, = (e for e in elem if e.tag.endswith('}title'))
-                text, = (e for e in revision if e.tag.endswith('}text'))
-                revid, = (e for e in revision if e.tag.endswith('}id'))
-                page = self._page_object(wiki, pagename.text)
-                page.last_revision = int(revid.text)
-                page.revision = int(revid.text)
-                page.contents = text.text
-                wiki.session.add(page)
-                fetched_titles.append(pagename.text)
-            else:
-                raise ValueError(tag)
-        wiki.session.commit()
-        return fetched_titles
 
     def invalidate_cache(self, wiki):
         """Invalidate the entire cache
@@ -472,7 +329,8 @@ class WikiCache(object):
         Submits work to the queues until a page is fully fetched from the
         server, then sets the PageProxy result to unblock the consumer
         """
-        wiki = self._get_wiki()
+        self._updated.get()
+        wiki = self.get_wiki()
         title = result.title
         obj = self._page_object(wiki, title)
         wiki.session.add(obj)
@@ -484,16 +342,12 @@ class WikiCache(object):
             if obj.last_revision is None or (not obj.up_to_date and
                     obj.contents is None):
                 self.log('Requesting metadata for {}'.format(title))
-                md = AsyncResult()
-                self._needed_metadata.put((title, md))
-                md.get()
+                info = MetadataRequest(self, title, []).go()
             # Now, if metadata says we're out of date, actually fetch the page
             wiki.session.refresh(obj)
             if not obj.up_to_date:
                 self.log('Requesting page {}'.format(title))
-                rd = AsyncResult()
-                self._needed_pages.put((title, rd))
-                rd.get()
+                PageRequest(self, title).go()
             # If everything was successful, notify the caller!
             wiki.session.refresh(obj)
             if obj.up_to_date:
@@ -505,3 +359,168 @@ class WikiCache(object):
         """Return the content of a page, if it exists, or raise KeyError
         """
         return self.get(title)
+
+
+class Request(object):
+    """A request to the remote server
+
+    Requests can be grouped together by a "group key". All requests with
+    the same group key can be gotten with the same API request.
+
+    The cache's request-loop will take requests, and as soon as there's enough
+    of them for an an API request, it does that request.
+    If there's not enough requests for a while, it fires an "incomplete"
+    request.
+    """
+    limit = 50
+
+    def __init__(self, cache):
+        self.cache = cache
+        self.result = AsyncResult()
+        self._subordinates = []
+
+    def go(self):
+        """Schedule the request and block until it's done"""
+        self.cache.request_queue.put(self)
+        return self.result.get()
+
+    def insert_into(self, all_requests):
+        """Insert this request into the given dict
+
+        Run this from the request-loop greenlet; it can do the actual
+        API request if enough requests have accumulated.
+        How many are needed is specified in the "limit" variable.
+        """
+        peers = all_requests.setdefault(self.group_key, {})
+        try:
+            master = peers[self.key]
+        except KeyError:
+            peers[self.key] = self
+        else:
+            master._subordinates.append(self)
+        if len(peers) >= self.limit:
+            self.run(all_requests)
+
+    @property
+    def group_key(self):
+        return (self, )
+
+    @property
+    def key(self):
+        return self
+
+    def run(self, all_requests):
+        pass
+
+    def _all_finished_requests(self, all_requests, key):
+        master = all_requests.get(self.group_key, {}).pop(key, None)
+        if master:
+            yield master
+            for s in master._subordinates:
+                yield s
+
+
+def powerset(iterable):
+    "powerset([1,2,3]) --> () (1,) (2,) (3,) (1,2) (1,3) (2,3) (1,2,3)"
+    s = list(iterable)
+    return itertools.chain.from_iterable(
+        itertools.combinations(s, r) for r in range(len(s)+1))
+
+
+class MetadataRequest(Request):
+    limit = 100
+
+    def __init__(self, cache, title, token_requests):
+        super(MetadataRequest, self).__init__(cache)
+        self.title = title
+        self.token_requests = tuple(sorted(token_requests))
+        self.result = AsyncResult()
+
+    @property
+    def group_key(self):
+        return MetadataRequest, self.token_requests
+
+    @property
+    def key(self):
+        return self.title
+
+    def _all_finished_requests(self, all_requests, key):
+        # A bit more complicated since we can mark all requests with a subset
+        # of our tokens as done
+        mdr, token_requests = self.group_key
+        for subset in powerset(token_requests):
+            peers = all_requests.get((MetadataRequest, subset), {})
+            master = peers.pop(key, None)
+            if master:
+                yield master
+                for s in master._subordinates:
+                    yield s
+
+    def run(self, all_requests):
+        wiki = self.cache.get_wiki()
+        titles = all_requests[self.group_key].keys()
+        # TODO: Fill up request if we can fetch more
+        result = self.cache.apirequest(action='query', info='lastrevid',
+                prop='revisions',  # should not be necessary on modern MW
+                titles='|'.join(titles))
+        assert 'normalized' not in result['query'], (
+                result['query']['normalized'])  # XXX: normalization
+        fetched_titles = []
+        for page_info in result['query'].get('pages', []):
+            title = page_info['title']
+            page = self.cache._page_object(wiki, title)
+            wiki.session.add(page)
+            if 'missing' in page_info:
+                page.last_revision = 0
+                page.revision = 0
+                page.contents = None
+            else:
+                revid = page_info['revisions'][0]['revid']
+                # revid = page_info['lastrevid']  # for the modern MW
+                page.last_revision = revid
+            for p in self._all_finished_requests(all_requests, title):
+                p.result.set(page_info)
+        wiki.session.commit()
+
+
+class PageRequest(Request):
+    def __init__(self, cache, title):
+        super(PageRequest, self).__init__(cache)
+        self.title = title
+
+    @property
+    def group_key(self):
+        return (PageRequest,)
+
+    @property
+    def key(self):
+        return self.title
+
+    def run(self, all_requests):
+        wiki = self.cache.get_wiki()
+        titles = all_requests[self.group_key].keys()
+
+        dump = self.cache._apirequest_raw(action='query',
+            export='1', exportnowrap='1',
+            titles='|'.join(titles)).raw
+        tree = ElementTree.parse(dump)
+        for elem in tree.getroot():
+            tag = elem.tag
+            if tag.endswith('}siteinfo'):
+                continue
+            elif tag.endswith('}page'):
+                revision, = (e for e in elem if e.tag.endswith('}revision'))
+                pagename, = (e for e in elem if e.tag.endswith('}title'))
+                text, = (e for e in revision if e.tag.endswith('}text'))
+                revid, = (e for e in revision if e.tag.endswith('}id'))
+                title = pagename.text
+                page = self.cache._page_object(wiki, title)
+                page.last_revision = int(revid.text)
+                page.revision = int(revid.text)
+                page.contents = text.text
+                wiki.session.add(page)
+                for p in self._all_finished_requests(all_requests, title):
+                    p.result.set()
+            else:
+                raise ValueError(tag)
+        wiki.session.commit()
