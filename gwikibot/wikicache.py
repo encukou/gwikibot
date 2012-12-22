@@ -6,7 +6,7 @@ import collections
 
 import gevent
 import requests
-from gevent.event import AsyncResult
+from gevent.event import AsyncResult, Event
 from gevent.queue import Queue, Empty
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -113,10 +113,17 @@ class WikiCache(object):
         self.limit = limit
         self.request_queue = Queue(0)
 
-        self._updated = AsyncResult()
+        self._updated = Event()
 
-        gevent.spawn(self._request_loop, force_sync)
-        gevent.sleep(0)
+        self._loop = gevent.spawn(self._request_loop, force_sync)
+
+    def request(self, req):
+        if self._loop.ready():
+            self.log('Restarting request loop')
+            self._loop = gevent.spawn(self._request_loop)
+            self._updated.wait()
+        if req:
+            self.request_queue.put(req)
 
     def get_wiki(self):
         """Get the wiki object, creating one if necessary"""
@@ -172,8 +179,8 @@ class WikiCache(object):
         self._sleep_before_request()
 
         try:
+            self.log('POST {} {}'.format(self._url_base, params))
             result = requests.post(self._url_base, data=params, stream=True)
-            self.log('POST {} {}'.format(result.url, params))
             result.raise_for_status()
             return result
         finally:
@@ -185,7 +192,7 @@ class WikiCache(object):
         params['format'] = 'yaml'
         return yaml.safe_load(self._apirequest_raw(**params).text)
 
-    def update(self, force_sync=True):
+    def update(self, force_sync=False):
         """Fetch a batch of page changes from the server"""
         wiki = self.get_wiki()
         if wiki.last_update and not force_sync:
@@ -257,7 +264,7 @@ class WikiCache(object):
             obj.last_revision = None
             return obj
 
-    def _request_loop(self, force_sync):
+    def _request_loop(self, force_sync=False):
         """The greenlet that requests needed metadata/pages
         """
         self.update(force_sync=force_sync)
@@ -266,10 +273,12 @@ class WikiCache(object):
         requests = {}
         while True:
             self.log('Request loop active')
+            self.update()
 
             while True:
                 while not self.request_queue.empty():
                     self.request_queue.get().insert_into(requests)
+                    gevent.sleep(0)
                 try:
                     request = self.request_queue.get(
                         timeout=self._sleep_seconds())
@@ -285,9 +294,13 @@ class WikiCache(object):
                 for k, v in request_list[0][1].items():
                     v.run(requests)
                     break
-            else:
-                self.update(force_sync=False)
-                gevent.sleep(self._sleep_seconds() or 1)
+
+            if not request_list:
+                self._sleep_before_request()
+                if self.request_queue.empty():
+                    self._updated.clear()
+                    self.log('Request loop exiting')
+                    return
 
 
     def invalidate_cache(self, wiki):
@@ -337,7 +350,7 @@ class WikiCache(object):
         Submits work to the queues until a page is fully fetched from the
         server, then sets the PageProxy result to unblock the consumer
         """
-        self._updated.get()
+        self.request(None)
         wiki = self.get_wiki()
         title = result.title
         obj = self._page_object(wiki, title)
@@ -397,7 +410,7 @@ class Request(object):
 
     def go(self):
         """Schedule the request and block until it's done"""
-        self.cache.request_queue.put(self)
+        self.cache.request(self)
         return self.result.get()
 
     def insert_into(self, all_requests):
