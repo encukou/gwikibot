@@ -23,6 +23,7 @@ from gwikibot import monkey
 
 monkey.patch()
 
+
 class PageProxy(object):
     """A page in a wiki
 
@@ -36,20 +37,18 @@ class PageProxy(object):
         self.title = title
         self.cache = cache
         self._result = AsyncResult()
+        self.edits = {}
 
-    def _set_result(self, contents):
-        self._result.set(contents)
-
-    @property
-    def up_to_date(self):
-        """Return True if the page is up to date"""
-        self._result.get()
-        return True
+    def _set_result(self, contents, page_info):
+        self._contents = contents
+        self.page_info = page_info
+        self._result.set()
 
     @property
     def contents(self):
-        """Return the contents of the page, or None if the page is missing"""
-        return self._result.get()
+        """Return true if the page exists on the wiki"""
+        self._result.get()
+        return self._contents
 
     @property
     def exists(self):
@@ -59,6 +58,7 @@ class PageProxy(object):
     @property
     def text(self):
         """Return the contents of the page; raise ValueError if page missing"""
+        self._result.get()
         if self.exists:
             return self.contents
         else:
@@ -67,6 +67,14 @@ class PageProxy(object):
     def __bool__(self):
         return self.exists
     __nonzero__ = __bool__
+
+    def edit(self, text, section=None):
+        self._result.get()
+        if not self.page_info['edittoken']:
+            raise ValueError('This Page is not editable')
+        else:
+            self.edits[section] = text
+            EditRequest(self.cache, self).go()
 
 
 class WikiCache(object):
@@ -279,7 +287,7 @@ class WikiCache(object):
                     break
             else:
                 self.update(force_sync=False)
-                gevent.sleep(self._sleep_seconds())
+                gevent.sleep(self._sleep_seconds() or 1)
 
 
     def invalidate_cache(self, wiki):
@@ -323,7 +331,7 @@ class WikiCache(object):
         gevent.spawn(self._read, result)
         return result
 
-    def _read(self, result):
+    def _read(self, result, token_requests=()):
         """Greenlet to fill a PageProxy object
 
         Submits work to the queues until a page is fully fetched from the
@@ -340,9 +348,11 @@ class WikiCache(object):
         while True:
             # Fetch metadata to see if the page has changed (or is empty!)
             if obj.last_revision is None or (not obj.up_to_date and
-                    obj.contents is None):
+                    obj.contents is None) or token_requests:
                 self.log('Requesting metadata for {}'.format(title))
-                info = MetadataRequest(self, title, []).go()
+                page_info = MetadataRequest(self, title, token_requests).go()
+            else:
+                page_info = {}
             # Now, if metadata says we're out of date, actually fetch the page
             wiki.session.refresh(obj)
             if not obj.up_to_date:
@@ -351,7 +361,7 @@ class WikiCache(object):
             # If everything was successful, notify the caller!
             wiki.session.refresh(obj)
             if obj.up_to_date:
-                result._set_result(obj.contents)
+                result._set_result(obj.contents, page_info)
                 wiki.session.rollback()
                 return
 
@@ -359,6 +369,12 @@ class WikiCache(object):
         """Return the content of a page, if it exists, or raise KeyError
         """
         return self.get(title)
+
+    def get_editable(self, title):
+        title = self.normalize_title(title)
+        result = PageProxy(self, title)
+        gevent.spawn(self._read, result, ['edit'])
+        return result
 
 
 class Request(object):
@@ -460,9 +476,15 @@ class MetadataRequest(Request):
         wiki = self.cache.get_wiki()
         titles = all_requests[self.group_key].keys()
         # TODO: Fill up request if we can fetch more
-        result = self.cache.apirequest(action='query', info='lastrevid',
+        kwargs = dict(
+                action='query', info='lastrevid',
                 prop='revisions',  # should not be necessary on modern MW
-                titles='|'.join(titles))
+                titles='|'.join(titles)
+            )
+        if self.token_requests:
+            kwargs['prop'] += '|info'
+            kwargs['intoken'] = '|'.join(self.token_requests)
+        result = self.cache.apirequest(**kwargs)
         assert 'normalized' not in result['query'], (
                 result['query']['normalized'])  # XXX: normalization
         fetched_titles = []
@@ -524,3 +546,64 @@ class PageRequest(Request):
             else:
                 raise ValueError(tag)
         wiki.session.commit()
+
+
+class SingleRequest(Request):
+    """A request that can't be combined with others
+
+    A SingleRequest is run as soon as it's picked up from the request queue.
+    """
+    limit = 1
+
+    def insert_into(self, all_requests):
+        self.run(all_requests)
+
+
+class EditRequest(SingleRequest):
+    def __init__(self, cache, pageproxy):
+        super(EditRequest, self).__init__(cache)
+        self.pageproxy = pageproxy
+        self.title = pageproxy.title
+        self.edittoken = pageproxy.page_info['edittoken']
+        self.starttimestamp = pageproxy.page_info['starttimestamp']
+
+    def run(self, all_requests):
+        pageproxy = self.pageproxy
+        edits = pageproxy.edits
+        if not edits:
+            return
+
+        revid = None
+
+        wiki = self.cache.get_wiki()
+        page = self.cache._page_object(wiki, self.title)
+        page.last_revision = None
+        wiki.session.commit()
+
+        whole_page_edit = edits.pop(None)
+        if (whole_page_edit is not None and
+                (pageproxy.contents is None or
+                    whole_page_edit != pageproxy.contents)):
+            self.do_edit(None, whole_page_edit)
+        for section, text in edits.items():
+            self.do_edit(section, text)
+
+        self.result.set()
+
+    def do_edit(self, section, text):
+        kwargs = dict(
+            action='edit',
+            title=self.title,
+            text=text,
+            token=self.edittoken,
+            summary='gwikibot edit',  # TODO
+            minor=False,  # TODO
+            bot=True,  # TODO
+            starttimestamp=self.starttimestamp,
+            # TODO: recreate, createonly, nocreate
+        )
+        if section is not None:
+            kwargs['section'] = section
+        result = self.cache.apirequest(**kwargs)
+        revid = result['edit']['newrevid']
+        self.starttimestamp = result['edit']['newtimestamp']
