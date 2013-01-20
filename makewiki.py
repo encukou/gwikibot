@@ -70,10 +70,15 @@ class WikiMaker(object):
     def handle_print(self, print_):
         title = self.print_page_title(print_)
         page = self.cache.get_editable(title)
-        prints = sorted(print_.card.prints, key=lambda p: (p.set_id, p.order))
+        prints = [p
+            for c in print_.card.family.cards
+                if [m.name for m in c.mechanics] == [m.name for m in print_.card.mechanics]
+            for p in c.prints
+        ]
+        prints.sort(key=lambda p: (p.set_id, p.order))
         if print_ is prints[0]:
             section = self.render('card.mako',
-                card=print_.card,
+                card=prints[-1].card,
                 first_print=prints[0],
                 last_print=prints[-1],
                 prints=prints,
@@ -130,7 +135,7 @@ class WikiMaker(object):
         query = query.options(lazyload('card.card_subclasses'))
 
         query = query.filter(tcg_tables.CardFamily.identifier.in_(
-            'toxicroak galactic-hq'.split()
+            'toxicroak galactic-hq charizard'.split()
         ))
 
         for print_ in query:
