@@ -12,6 +12,7 @@ import gevent.pool
 from sqlalchemy.orm import (
     joinedload, joinedload_all, subqueryload, subqueryload_all, lazyload)
 
+url = 'http://mediawiki-encukou.rhcloud.com/api.php'
 url = 'http://localhost/api.php'
 
 
@@ -49,10 +50,9 @@ class WikiMaker(object):
         template = self.template_lookup.get_template(filename)
         return template.render(**args)
 
-    def card_page_title(self, card):
-        print_ = min(card.prints, key=lambda p: p.set_id)
+    def print_page_title(self, print_):
         return '{}TCG:{} ({} {})'.format(
-            self.prefix, card.name, print_.set.name, print_.set_number)
+            self.prefix, print_.card.name, print_.set.name, print_.set_number)
 
     def set_page_title(self, tcg_set):
         return '{}TCG:{}'.format(self.prefix, tcg_set.name)
@@ -67,22 +67,29 @@ class WikiMaker(object):
         else:
             page.edit(section)
 
-    def handle_card(self, card):
-        title = self.card_page_title(card)
+    def handle_print(self, print_):
+        title = self.print_page_title(print_)
         page = self.cache.get_editable(title)
-        prints = card.prints
-        section = self.render('card.mako',
-            card=card,
-            first_print=min(prints, key=lambda p: p.set_id),
-            last_print=max(prints, key=lambda p: p.set_id),
-            prints=prints,
-        )
+        prints = sorted(print_.card.prints, key=lambda p: (p.set_id, p.order))
+        if print_ is prints[0]:
+            section = self.render('card.mako',
+                card=print_.card,
+                first_print=prints[0],
+                last_print=prints[-1],
+                prints=prints,
+            )
+            self.spawn(self.handle_release_info, print_)
+        else:
+            section = '#REDIRECT: [[{}]]'.format(
+                self.print_page_title(prints[0]))
         if not page.exists:
             print('Create new page', title)
             page.edit(section)
         else:
             page.edit(section)
 
+    def handle_release_info(self, print_):
+        title = self.print_page_title(print_)
         page = self.cache.get_editable(title + ' Release Info')
         if not page.exists:
             page.edit('.')
@@ -90,44 +97,44 @@ class WikiMaker(object):
     def run(self):
         Query = self.session.query
 
-        query = Query(tcg_tables.Card).order_by(tcg_tables.Card.id)
+        query = Query(tcg_tables.Print)
+        query = query.join(tcg_tables.Print.card)
         query = query.join(tcg_tables.Card.family)
-        query = query.options(joinedload_all('prints.set'))
-        query = query.options(subqueryload('card_types'))
-        query = query.options(joinedload_all('family.names_local'))
-        query = query.options(joinedload_all('card_subclasses.subclass.names_local'))
-        query = query.options(joinedload_all('prints.pokemon_flavor.flavor_local'))
-        query = query.options(joinedload_all('prints.pokemon_flavor.species.names_local'))
-        query = query.options(joinedload_all('card_mechanics.mechanic.effects_local'))
-        query = query.options(joinedload_all('card_mechanics.mechanic.class_.names_local'))
-        query = query.options(joinedload_all('card_types.type.names_local'))
-        query = query.options(joinedload_all('stage.names_local'))
-        query = query.options(joinedload_all('prints.illustrator'))
-        query = query.options(joinedload_all('evolutions.family.names_local'))
-        query = query.options(joinedload_all('family.evolutions.card.family.names_local'))
-        query = query.options(joinedload_all('family.evolutions.card.prints.set.names_local'))
-        query = query.options(joinedload_all('family.evolutions.card.card_mechanics.mechanic.names_local'))
-        query = query.options(joinedload_all('card_mechanics.mechanic.costs.type.names_local'))
-        query = query.options(joinedload_all('damage_modifiers.type.names_local'))
-        query = query.options(subqueryload('card_mechanics.mechanic.costs'))
-        query = query.options(subqueryload('family.evolutions'))
-        query = query.options(subqueryload('family.evolutions.card.prints'))
-        query = query.options(subqueryload('family.evolutions.card.card_mechanics'))
-        query = query.options(subqueryload('family.cards.prints'))
-        query = query.options(subqueryload('prints.scans'))
-        query = query.options(lazyload('prints.pokemon_flavor.species.default_pokemon'))
-        query = query.options(lazyload('prints.pokemon_flavor.species.evolutions'))
-        query = query.options(lazyload('prints'))
-        query = query.options(lazyload('card_mechanics'))
-        query = query.options(lazyload('damage_modifiers'))
-        query = query.options(lazyload('card_subclasses'))
+        query = query.options(joinedload_all('set'))
+        query = query.options(subqueryload('card.card_types'))
+        query = query.options(joinedload_all('card.family.names_local'))
+        query = query.options(joinedload_all('card.card_subclasses.subclass.names_local'))
+        query = query.options(joinedload_all('pokemon_flavor.flavor_local'))
+        query = query.options(joinedload_all('pokemon_flavor.species.names_local'))
+        query = query.options(joinedload_all('card.card_mechanics.mechanic.effects_local'))
+        query = query.options(joinedload_all('card.card_mechanics.mechanic.class_.names_local'))
+        query = query.options(joinedload_all('card.card_types.type.names_local'))
+        query = query.options(joinedload_all('card.stage.names_local'))
+        query = query.options(joinedload_all('illustrator'))
+        query = query.options(joinedload_all('card.evolutions.family.names_local'))
+        query = query.options(joinedload_all('card.family.evolutions.card.family.names_local'))
+        query = query.options(joinedload_all('card.family.evolutions.card.prints.set.names_local'))
+        query = query.options(joinedload_all('card.family.evolutions.card.card_mechanics.mechanic.names_local'))
+        query = query.options(joinedload_all('card.card_mechanics.mechanic.costs.type.names_local'))
+        query = query.options(joinedload_all('card.damage_modifiers.type.names_local'))
+        query = query.options(subqueryload('card.card_mechanics.mechanic.costs'))
+        query = query.options(subqueryload('card.family.evolutions'))
+        query = query.options(subqueryload('card.family.evolutions.card.prints'))
+        query = query.options(subqueryload('card.family.evolutions.card.card_mechanics'))
+        query = query.options(subqueryload('card.family.cards.prints'))
+        query = query.options(subqueryload('scans'))
+        query = query.options(lazyload('pokemon_flavor.species.default_pokemon'))
+        query = query.options(lazyload('pokemon_flavor.species.evolutions'))
+        query = query.options(lazyload('card.card_mechanics'))
+        query = query.options(lazyload('card.damage_modifiers'))
+        query = query.options(lazyload('card.card_subclasses'))
 
         query = query.filter(tcg_tables.CardFamily.identifier.in_(
-            'zapdos'.split()
+            'toxicroak galactic-hq'.split()
         ))
 
-        for card in query:
-            self.spawn(self.handle_card, card)
+        for print_ in query:
+            self.spawn(self.handle_print, print_)
 
         query = Query(tcg_tables.Set).order_by(tcg_tables.Set.id)
         query = query.options(subqueryload_all('prints.card.family.names'))
