@@ -115,7 +115,7 @@ class WikiMaker(object):
         query = query.options(joinedload_all('card.card_mechanics.mechanic.class_.names_local'))
         query = query.options(joinedload_all('card.card_types.type.names_local'))
         query = query.options(joinedload_all('card.stage.names_local'))
-        query = query.options(joinedload_all('illustrator'))
+        query = query.options(joinedload_all('print_illustrators.illustrator'))
         query = query.options(joinedload_all('card.evolutions.family.names_local'))
         query = query.options(joinedload_all('card.family.evolutions.card.family.names_local'))
         query = query.options(joinedload_all('card.family.evolutions.card.prints.set.names_local'))
@@ -135,7 +135,7 @@ class WikiMaker(object):
         query = query.options(lazyload('card.card_subclasses'))
 
         query = query.filter(tcg_tables.CardFamily.identifier.in_(
-            'toxicroak galactic-hq charizard'.split()
+            'toxicroak galactic-hq charizard psychic-energy potion'.split()
         ))
 
         for print_ in query:
